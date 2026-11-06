@@ -1,20 +1,28 @@
-"""Renderiza el dashboard del Kindle como PNG en escala de grises.
+"""Renderiza el dashboard del Kindle (y las notas para leer) como PNG en escala de grises.
 
-Fuentes: Open-Meteo (clima), Google News AR (noticias), El Cronista (dólar), Nasdaq (VOO).
-Salida: out/dash_<W>x<H>.png para cada tamaño de pantalla soportado + out/dash.png.
-La franja superior queda en blanco: ahí el Kindle dibuja la hora cada minuto.
+Fuentes: Open-Meteo (clima), La Nación RSS (noticias, trae el texto completo de cada nota).
+Salida:
+  out/dash_<W>x<H>.png            dashboard por tamaño de pantalla (+ out/dash.png)
+  out/<KEY>/zones_<W>x<H>.txt     una línea por noticia: "<y0> <y1> <id> <páginas>"
+  out/<KEY>/<id>_<p>_<W>x<H>.png  páginas de cada nota
+<KEY> sale del secret ARTICLES_KEY: las notas no quedan en una URL pública adivinable.
+La franja superior del dashboard queda en blanco: ahí el Kindle dibuja la hora cada minuto.
 """
 
 from __future__ import annotations
 
+import hashlib
 import html
 import json
+import os
 import re
 import shutil
 import sys
 import urllib.request
 import xml.etree.ElementTree as ET
 from datetime import datetime
+from email.utils import parsedate_to_datetime
+from html.parser import HTMLParser
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -30,6 +38,13 @@ LAT, LON = -34.61, -58.38  # CABA
 SIZES = [(600, 800), (758, 1024), (1072, 1448), (1236, 1648), (1264, 1680)]
 DEFAULT_SIZE = (1072, 1448)
 CLOCK_BAND = 0.12  # fracción de alto reservada para la hora que dibuja el Kindle
+BACK_BAND = 0.12   # en una nota, tocar esta franja de arriba vuelve al dashboard
+
+NEWS_FEED = "https://www.lanacion.com.ar/arc/outboundfeeds/rss/?outputType=xml"
+NEWS_MAX = 14            # noticias candidatas (se dibujan las que entren)
+PER_CATEGORY = 2         # variedad: como mucho 2 por sección
+SKIP_CATEGORIES = {"california", "florida", "texas", "nueva york", "estados unidos"}  # contenido para EE.UU.
+ARTICLE_MAX_PAGES = 12
 
 UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) AppleWebKit/537.36 Chrome/130 Safari/537.36"
 
@@ -90,54 +105,84 @@ def get_weather() -> dict:
     }
 
 
-def get_dolar() -> list[tuple[str, str, str]]:
-    s = fetch("https://www.cronista.com/MercadosOnline/dolar.html")
-    t = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", "|", s))
-    t = re.sub(r"(\|\s*)+", "|", t)
-    found: dict[str, tuple[str, str]] = {}
-    pat = r"\|(D[óo]lar [^|]{2,30})\|(?:Seguir\|)?Venta\|\$\|([\d.,]+)\|Compra\|\$\|([\d.,]+)"
-    for name, venta, compra in re.findall(pat, t):
-        key = html.unescape(name).strip().lower()
-        found.setdefault(key, (compra, venta))
-    wanted = [("Oficial BNA", "dólar bna"), ("Blue", "dólar blue"),
-              ("MEP", "dólar mep"), ("CCL", "dólar ccl"), ("Tarjeta", "dólar turista")]
-    rows = []
-    for label, key in wanted:
-        if key in found and found[key][1] != "0,00":
-            c, v = (x.split(",")[0] for x in found[key])
-            rows.append((label, c, v))
-    if not rows:
-        raise RuntimeError("Cronista: no encontré cotizaciones")
-    return rows
+class _Paragraphs(HTMLParser):
+    """HTML de la nota -> párrafos de texto plano (sin tweets, embeds ni imágenes)."""
+
+    BLOCK = {"p", "h1", "h2", "h3", "h4", "li"}
+    SKIP = {"blockquote", "script", "style", "iframe", "figure", "figcaption", "table"}
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.paras: list[tuple[str, bool]] = []  # (texto, es_subtítulo)
+        self.cur: list[str] = []
+        self.skip = 0
+        self.heading = False
+
+    def _flush(self):
+        t = re.sub(r"\s+", " ", "".join(self.cur)).strip()
+        if t:
+            self.paras.append((t, self.heading))
+        self.cur, self.heading = [], False
+
+    def handle_starttag(self, tag, attrs):
+        if tag in self.SKIP:
+            self.skip += 1
+        elif tag in self.BLOCK:
+            self._flush()
+            self.heading = tag.startswith("h")
+        elif tag == "br":
+            self.cur.append(" ")
+
+    def handle_endtag(self, tag):
+        if tag in self.SKIP:
+            self.skip = max(0, self.skip - 1)
+        elif tag in self.BLOCK:
+            self._flush()
+
+    def handle_data(self, data):
+        if not self.skip:
+            self.cur.append(data)
+
+    def close(self):
+        super().close()
+        self._flush()
 
 
-def get_voo() -> dict:
-    d = json.loads(fetch("https://api.nasdaq.com/api/quote/VOO/info?assetclass=etf",
-                         accept="application/json"))["data"]
-    p = d["primaryData"]
-    return {
-        "price": p["lastSalePrice"],
-        "change": p["netChange"],
-        "pct": p["percentageChange"],
-        "up": p.get("deltaIndicator") == "up",
-        "status": "Abierto" if d.get("marketStatus") == "Open" else "Cerrado",
-        "when": p.get("lastTradeTimestamp", ""),
-    }
+def article_paragraphs(raw_html: str) -> list[tuple[str, bool]]:
+    p = _Paragraphs()
+    p.feed(raw_html)
+    p.close()
+    return p.paras
 
 
-def get_news(n: int = 8) -> list[tuple[str, str]]:
-    xml = fetch("https://news.google.com/rss?hl=es-419&gl=AR&ceid=AR:es-419")
-    root = ET.fromstring(xml)
-    out = []
+def get_news() -> list[dict]:
+    root = ET.fromstring(fetch(NEWS_FEED))
+    content_tag = "{http://purl.org/rss/1.0/modules/content/}encoded"
+    out, per_cat = [], {}
     for item in root.iter("item"):
         title = html.unescape(item.findtext("title") or "").strip()
-        src = (item.findtext("source") or "").strip()
-        if src and title.endswith(" - " + src):
-            title = title[: -len(" - " + src)]
-        if title:
-            out.append((title, src))
-        if len(out) >= n:
+        cat = (item.findtext("category") or "").strip()
+        link = (item.findtext("link") or "").strip()
+        if not title or cat.lower() in SKIP_CATEGORIES or per_cat.get(cat, 0) >= PER_CATEGORY:
+            continue
+        body = item.findtext(content_tag) or ""
+        paras = article_paragraphs(body)
+        if not paras:
+            continue
+        try:
+            when = parsedate_to_datetime(item.findtext("pubDate") or "").astimezone(TZ)
+        except (TypeError, ValueError):
+            when = None
+        per_cat[cat] = per_cat.get(cat, 0) + 1
+        out.append({
+            # cambia si se edita la nota (ej. las "en vivo"): el Kindle solo baja ids nuevos
+            "id": hashlib.sha1(f"{link or title}\n{body}".encode()).hexdigest()[:10],
+            "title": title, "cat": cat, "when": when, "paras": paras,
+        })
+        if len(out) >= NEWS_MAX:
             break
+    if not out:
+        raise RuntimeError("La Nación: feed sin notas")
     return out
 
 
@@ -151,6 +196,16 @@ def safe(fn, *a):
 
 # ---------- dibujo ----------
 
+_FONT_CACHE: dict = {}
+
+
+def _font(name, px):
+    key = (name, px)
+    if key not in _FONT_CACHE:
+        _FONT_CACHE[key] = ImageFont.truetype(str(FONTS / name), px)
+    return _FONT_CACHE[key]
+
+
 class Painter:
     def __init__(self, w: int, h: int):
         self.w, self.h = w, h
@@ -161,7 +216,7 @@ class Painter:
 
     def font(self, size: float, bold=False, cond=False):
         name = "DejaVuSans" + ("Condensed" if cond else "") + ("-Bold" if bold else "") + ".ttf"
-        return ImageFont.truetype(str(FONTS / name), max(8, round(size * self.u)))
+        return _font(name, max(8, round(size * self.u)))
 
     def text(self, xy, s, size, bold=False, cond=False, fill=0, anchor="la"):
         f = self.font(size, bold, cond)
@@ -178,26 +233,39 @@ class Painter:
         self.text((self.m, y), label.upper(), 26, bold=True, fill=80)
         return y + round(40 * self.u)
 
-    def wrap(self, s, size, maxw, bold=False, cond=False, max_lines=3):
+    def wrap(self, s, size, maxw, bold=False, cond=False, max_lines=None):
         words, lines, cur = s.split(), [], ""
         for w_ in words:
             cand = (cur + " " + w_).strip()
             if self.width(cand, size, bold, cond) <= maxw:
                 cur = cand
             else:
-                lines.append(cur)
+                if cur:
+                    lines.append(cur)
                 cur = w_
         if cur:
             lines.append(cur)
-        if len(lines) > max_lines:
+        if max_lines and len(lines) > max_lines:
             lines = lines[:max_lines]
             while lines[-1] and self.width(lines[-1] + "…", size, bold, cond) > maxw:
                 lines[-1] = lines[-1].rsplit(" ", 1)[0] if " " in lines[-1] else lines[-1][:-1]
             lines[-1] += "…"
         return lines
 
+    def finish(self) -> Image.Image:
+        # 16 grises: lo que muestra la tinta electrónica, y el PNG pesa mucho menos
+        return self.img.point(lambda v: (v // 17) * 17)
 
-def render(size, now, weather, dolar, voo, news, errors) -> Image.Image:
+
+def meta_line(n: dict) -> str:
+    parts = [n["cat"]] if n["cat"] else []
+    if n["when"]:
+        parts.append(f"{n['when']:%H:%M}")
+    return " · ".join(parts)
+
+
+def render_dash(size, now, weather, news, errors):
+    """Devuelve (imagen, zonas) — zonas = [(y0, y1, id)] de cada noticia dibujada."""
     w, h = size
     p = Painter(w, h)
     u, m = p.u, p.m
@@ -208,86 +276,48 @@ def render(size, now, weather, dolar, voo, news, errors) -> Image.Image:
     p.text((w / 2, y), fecha, 40, anchor="ma", fill=40)
     y += round(56 * u)
     p.hline(y, 3)
-    y += round(26 * u)
+    y += round(24 * u)
 
-    # clima
-    y = p.heading(y, "Clima · Buenos Aires")
+    # clima, compacto: temperatura a la izquierda, hoy/mañana a la derecha
     if weather:
-        p.text((m, y - 10 * u), f"{weather['temp']}°", 120, bold=True)
-        tx = m + p.width(f"{weather['temp']}°", 120, bold=True) + 36 * u
-        p.text((tx, y), weather["desc"], 36, bold=True)
-        p.text((tx, y + 48 * u), f"Sensación {weather['feels']}° · Hum {weather['hum']}%", 30)
-        p.text((tx, y + 86 * u), f"Viento {weather['wind']} km/h", 30)
-        y += round(140 * u)
-        labels = ["Hoy", "Mañana"]
-        colw = (w - 2 * m) / 2
-        for i, dday in enumerate(weather["days"]):
-            x = m + i * colw
-            p.text((x, y), f"{labels[i]}: {dday['min']}° / {dday['max']}°", 32, bold=True)
-            p.text((x, y + 38 * u), f"{dday['desc']} · lluvia {dday['rain']}%", 26, cond=True)
-        y += round(80 * u)
+        p.text((m, y - 6 * u), f"{weather['temp']}°", 96, bold=True)
+        tx = m + p.width(f"{weather['temp']}°", 96, bold=True) + 28 * u
+        p.text((tx, y + 4 * u), weather["desc"], 30, bold=True)
+        p.text((tx, y + 44 * u), f"ST {weather['feels']}° · {weather['hum']}%", 26, fill=60)
+        p.text((tx, y + 78 * u), f"Viento {weather['wind']} km/h", 26, fill=60)
+        rx = w - m
+        for i, (label, dday) in enumerate(zip(["Hoy", "Mañana"], weather["days"])):
+            yy = y + 4 * u + i * 60 * u
+            p.text((rx, yy), f"{label} {dday['min']}°/{dday['max']}°", 28, bold=True, anchor="ra")
+            p.text((rx, yy + 32 * u), f"{dday['desc']} · {dday['rain']}%", 22, cond=True, fill=60, anchor="ra")
+        y += round(126 * u)
     else:
-        p.text((m, y), "Sin datos de clima", 32)
-        y += round(60 * u)
+        p.text((m, y), "Sin datos de clima", 30)
+        y += round(56 * u)
     p.hline(y)
-    y += round(26 * u)
+    y += round(24 * u)
 
-    # dólar (izq) + VOO (der)
-    top = y
-    colsplit = m + (w - 2 * m) * 0.60
-    y = p.heading(y, "Dólar · El Cronista")
-    if dolar:
-        cx, vx = colsplit - 180 * u, colsplit - 30 * u
-        p.text((cx, y), "Compra", 24, fill=90, anchor="ra")
-        p.text((vx, y), "Venta", 24, fill=90, anchor="ra")
-        y += round(36 * u)
-        for label, compra, venta in dolar:
-            p.text((m, y), label, 34, bold=True)
-            p.text((cx, y), compra, 34, anchor="ra")
-            p.text((vx, y), venta, 34, bold=True, anchor="ra")
-            y += round(46 * u)
-    else:
-        p.text((m, y), "Sin datos", 32)
-        y += round(46 * u)
-    left_bottom = y
-
-    y = top
-    vx0 = colsplit + 10 * u
-    p.d.rectangle([colsplit - 6 * u, top, colsplit - 4 * u, left_bottom - 10 * u], fill=160)
-    p.text((vx0, y), "VOO · S&P 500", 26, bold=True, fill=80)
-    y += round(48 * u)
-    if voo:
-        p.text((vx0, y), voo["price"], 58, bold=True)
-        y += round(78 * u)
-        arrow = "▲" if voo["up"] else "▼"
-        p.text((vx0, y), f"{arrow} {voo['change']} ({voo['pct']})", 30, bold=True)
-        y += round(46 * u)
-        p.text((vx0, y), f"Mercado {voo['status'].lower()}", 24, fill=80)
-        y += round(32 * u)
-        p.text((vx0, y), voo["when"], 24, fill=80)
-    else:
-        p.text((vx0, y), "Sin datos", 32)
-    y = max(left_bottom, y + 40 * u) + round(10 * u)
-    p.hline(y)
-    y += round(26 * u)
-
-    # noticias
-    y = p.heading(y, "Noticias · Argentina")
+    # noticias: todo el resto de la pantalla
+    y = p.heading(y, "Noticias · La Nación · tocá una para leerla")
     footer_y = h - round(44 * u)
+    zones = []
     if news:
         maxw = w - 2 * m - 30 * u
-        for title, src in news:
-            lines = p.wrap(title, 28, maxw, bold=True, max_lines=2)
-            need = len(lines) * 35 * u + 30 * u + 14 * u
+        line_h, gap = round(35 * u), round(16 * u)
+        for n in news:
+            lines = p.wrap(n["title"], 28, maxw, bold=True, max_lines=2)
+            need = len(lines) * line_h + round(27 * u) + gap
             if y + need > footer_y - 10 * u:
-                continue
+                break
+            y0 = y
             p.d.ellipse([m, y + 11 * u, m + 11 * u, y + 22 * u], fill=0)
             for ln in lines:
                 p.text((m + 30 * u, y), ln, 28, bold=True)
-                y += round(35 * u)
-            if src:
-                p.text((m + 30 * u, y), src, 22, fill=90)
-            y += round(30 * u + 14 * u)
+                y += line_h
+            p.text((m + 30 * u, y), meta_line(n), 21, fill=90)
+            y += round(27 * u)
+            zones.append((round(y0 - gap / 2), round(y + gap / 2), n["id"]))
+            y += gap
     else:
         p.text((m, y), "Sin noticias", 32)
 
@@ -296,32 +326,107 @@ def render(size, now, weather, dolar, voo, news, errors) -> Image.Image:
     if errors:
         foot += " · sin datos: " + ", ".join(errors)
     p.text((w / 2, footer_y), foot, 22, fill=110, anchor="ma")
-    return p.img
+    return p.finish(), zones
+
+
+def render_article(size, n) -> list[Image.Image]:
+    """Pagina la nota. Tocar arriba vuelve; izquierda/derecha cambian de página."""
+    w, h = size
+    probe = Painter(w, h)
+    u, m = probe.u, probe.m
+    maxw = w - 2 * m
+    top = round(h * BACK_BAND)
+    bottom = h - round(70 * u)
+
+    # bloques = (líneas, tamaño, bold, alto de línea, espacio después)
+    blocks = [(probe.wrap(n["title"], 42, maxw, bold=True), 42, True, 54, 14),
+              ([meta_line(n)], 24, False, 34, 26)]
+    for text, is_head in n["paras"]:
+        if is_head:
+            blocks.append((probe.wrap(text, 32, maxw, bold=True), 32, True, 44, 12))
+        else:
+            blocks.append((probe.wrap(text, 30, maxw), 30, False, 44, 20))
+
+    # repartir línea por línea en páginas
+    pages: list[list] = [[]]
+    y = top
+    for lines, px, bold, lh, after in blocks:
+        for ln in lines:
+            if y + lh * u > bottom:
+                pages.append([])
+                y = top
+            pages[-1].append((ln, px, bold, y))
+            y += lh * u
+        y += after * u
+    truncated = len(pages) > ARTICLE_MAX_PAGES
+    pages = pages[:ARTICLE_MAX_PAGES]
+
+    imgs = []
+    total = len(pages)
+    head_y = round(h * BACK_BAND * 0.42)
+    for i, items in enumerate(pages, 1):
+        p = Painter(w, h)
+        p.text((m, head_y), "‹ Volver (tocá arriba)", 26, bold=True, fill=80)
+        p.text((w - m, head_y), f"{i}/{total}", 26, bold=True, fill=80, anchor="ra")
+        p.hline(top - round(20 * u), 1)
+        for ln, px, bold, yy in items:
+            p.text((m, yy), ln, px, bold=bold)
+        if i < total:
+            hint = "← izquierda: anterior · derecha: siguiente →"
+        else:
+            hint = "Fin" + (" · sigue en lanacion.com.ar" if truncated else "") + " · tocá para volver"
+        p.text((w / 2, h - round(46 * u)), hint, 22, fill=110, anchor="ma")
+        imgs.append(p.finish())
+    return imgs
 
 
 def main():
     now = datetime.now(TZ)
     weather, e1 = safe(get_weather)
-    dolar, e2 = safe(get_dolar)
-    voo, e3 = safe(get_voo)
-    news, e4 = safe(get_news)
-    errors = [n for n, e in [("clima", e1), ("dólar", e2), ("VOO", e3), ("noticias", e4)] if e]
+    news, e2 = safe(get_news)
+    errors = [n for n, e in [("clima", e1), ("noticias", e2)] if e]
 
-    OUT.mkdir(exist_ok=True)
+    key = os.environ.get("ARTICLES_KEY", "").strip()
+    if not key:
+        if os.environ.get("CI"):
+            print("[warn] falta ARTICLES_KEY: no publico las notas", file=sys.stderr)
+        else:
+            key = "local"  # pruebas en la compu
+
+    if OUT.exists():
+        shutil.rmtree(OUT)
+    OUT.mkdir()
     shutil.copy(FONTS / "DejaVuSans-Bold.ttf", OUT)  # el Kindle la usa para la hora
+    (OUT / "robots.txt").write_text("User-agent: *\nDisallow: /\n")
+    art_dir = OUT / key if key else None
+    if art_dir:
+        art_dir.mkdir()
+    by_id = {n["id"]: n for n in news or []}
+
     for size in SIZES:
-        img = render(size, now, weather, dolar, voo, news, errors)
-        img.save(OUT / f"dash_{size[0]}x{size[1]}.png", optimize=True)
+        tag = f"{size[0]}x{size[1]}"
+        img, zones = render_dash(size, now, weather, news, errors)
+        img.save(OUT / f"dash_{tag}.png", optimize=True)
         if size == DEFAULT_SIZE:
             img.save(OUT / "dash.png", optimize=True)
+        if not art_dir:
+            continue
+        rows = []
+        for y0, y1, nid in zones:
+            pages = render_article(size, by_id[nid])
+            for i, page in enumerate(pages, 1):
+                page.save(art_dir / f"{nid}_{i}_{tag}.png", optimize=True)
+            rows.append(f"{y0} {y1} {nid} {len(pages)}")
+        (art_dir / f"zones_{tag}.txt").write_text("".join(r + "\n" for r in rows))
+
     (OUT / "index.html").write_text(
-        "<!doctype html><meta charset=utf-8><title>Kindle dash</title>"
+        "<!doctype html><meta charset=utf-8><meta name=robots content=noindex><title>Kindle dash</title>"
         f"<p>Actualizado {now:%Y-%m-%d %H:%M} ART</p><img src=dash.png style='max-width:100%'>",
         encoding="utf-8",
     )
     print("ok", now.isoformat(), "errores:", errors or "ninguno")
     # falla el job solo si TODAS las fuentes cayeron
-    if len(errors) == 4:
+    if len(errors) == 2:
         sys.exit(1)
 
 

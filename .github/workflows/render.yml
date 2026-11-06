@@ -1,8 +1,14 @@
 name: render
 
+# Cada 15 min de verdad: el cron de GitHub corre cada 5-8 h en repos con poca actividad,
+# así que cada corrida, al terminar, espera hasta cumplir 15 min y dispara la siguiente
+# (workflow_dispatch con GITHUB_TOKEN sí arranca un run nuevo). La concurrencia deja como
+# mucho una corrida activa + una en cola, así que nunca hay dos cadenas en paralelo.
+# El cron queda de respaldo: si la cadena se corta, la vuelve a arrancar.
+
 on:
   schedule:
-    - cron: "*/15 * * * *"   # dashboard
+    - cron: "*/15 * * * *"   # respaldo de la cadena
     - cron: "0 3 1 * *"      # keepalive mensual (GitHub apaga los cron tras 60 días sin commits)
   workflow_dispatch:
   push:
@@ -12,18 +18,24 @@ permissions:
   contents: write
   pages: write
   id-token: write
+  actions: write
 
 concurrency:
   group: pages
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
   render:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     environment:
       name: github-pages
       url: ${{ steps.deploy.outputs.page_url }}
+    outputs:
+      started: ${{ steps.start.outputs.epoch }}
     steps:
+      - id: start
+        run: echo "epoch=$(date +%s)" >> "$GITHUB_OUTPUT"
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
@@ -31,6 +43,8 @@ jobs:
           cache: pip
       - run: pip install -r requirements.txt
       - run: python render.py
+        env:
+          ARTICLES_KEY: ${{ secrets.ARTICLES_KEY }}
       - uses: actions/upload-pages-artifact@v3
         with:
           path: out
@@ -43,3 +57,20 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git commit --allow-empty -m "keepalive"
           git push origin HEAD:main
+
+  next:
+    needs: render
+    if: always() && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: esperar hasta completar 15 min desde el inicio
+        run: |
+          start="${{ needs.render.outputs.started }}"
+          [ -n "$start" ] || start=$(date +%s)
+          wait=$(( start + 900 - $(date +%s) ))
+          [ "$wait" -gt 0 ] && sleep "$wait" || true
+      - name: disparar la próxima corrida
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run render.yml --ref main -R "$GITHUB_REPOSITORY"
