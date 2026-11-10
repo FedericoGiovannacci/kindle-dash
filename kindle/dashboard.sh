@@ -104,6 +104,7 @@ if [ "$1" = "--loop" ]; then
         [ -n "$viewWidth" ] && W=$viewWidth && H=$viewHeight
     fi
     BAND=$((H * 12 / 100))
+    BACK_ZONE=$((H * 20 / 100))   # en una nota: tocar el 20% de arriba vuelve (título incluido)
     PX=$((H * 9 / 100))
     TAG="${W}x${H}"
     log "pantalla $TAG"
@@ -197,7 +198,7 @@ if [ "$1" = "--loop" ]; then
             fi
             MODE=art; CUR_ID=$1; CUR_PAGES=$2; CUR_PAGE=1
             show_page
-        elif [ "$y" -lt "$BAND" ]; then
+        elif [ "$y" -lt "$BACK_ZONE" ]; then
             show_dash
         elif [ "$x" -lt $((W / 3)) ]; then
             if [ "$CUR_PAGE" -le 1 ]; then show_dash; else CUR_PAGE=$((CUR_PAGE - 1)); show_page; fi
