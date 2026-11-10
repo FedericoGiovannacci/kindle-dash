@@ -7,6 +7,7 @@
 # Cada minuto dibuja la hora; cada 15 minutos baja la imagen nueva y las notas.
 # Tocá una noticia para leerla: derecha = página siguiente, izquierda = anterior,
 # franja de arriba = volver. Si no tocás nada en 10 min, vuelve solo al dashboard.
+# En el dashboard, tocar la hora fuerza la actualización en el momento.
 # Para salir: reiniciá el Kindle (mantené el botón de encendido hasta que reinicie).
 #
 # Ajustes opcionales en /mnt/us/kindle-dash/config.sh (si los toques caen mal):
@@ -174,6 +175,13 @@ if [ "$1" = "--loop" ]; then
         CLOCK="$t"
     }
 
+    refresh_now() {  # tocar la hora en el dashboard: bajar todo ya
+        log "actualización manual"
+        [ -n "$FBINK" ] && "$FBINK" -q -m -y -2 "Actualizando..."
+        if fetch; then last=$(date +%s); fi
+        show "$IMG"; draw_clock
+    }
+
     show_dash() { MODE=dash; CUR_ID=""; show "$IMG"; draw_clock; }
 
     show_page() { show "$ART/${CUR_ID}_$CUR_PAGE.png"; }
@@ -188,7 +196,9 @@ if [ "$1" = "--loop" ]; then
         log "tap raw=$1,$2 pantalla=$x,$y modo=$MODE"
         LAST_TAP=$(date +%s)
 
-        if [ "$MODE" = dash ]; then
+        if [ "$MODE" = dash ] && [ "$y" -lt "$BAND" ]; then
+            refresh_now
+        elif [ "$MODE" = dash ]; then
             [ -f "$ZONES" ] || return
             hit="$(awk -v y="$y" '$1 <= y && y < $2 { print $3, $4; exit }' "$ZONES")"
             [ -n "$hit" ] || return
