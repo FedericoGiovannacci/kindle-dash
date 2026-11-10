@@ -1,6 +1,7 @@
 """Renderiza el dashboard del Kindle (y las notas para leer) como PNG en escala de grises.
 
-Fuentes: Open-Meteo (clima), La Nación RSS (noticias, trae el texto completo de cada nota).
+Fuentes: Open-Meteo (clima) y noticias de AI: Anthropic (arriba de todo), OpenAI, Google DeepMind,
+Simon Willison, Hacker News (filtrado por AI), TechCrunch AI y The Verge AI.
 Salida:
   out/dash_<W>x<H>.png            dashboard por tamaño de pantalla (+ out/dash.png)
   out/<KEY>/zones_<W>x<H>.txt     una línea por noticia: "<y0> <y1> <id> <páginas>"
@@ -18,14 +19,17 @@ import os
 import re
 import shutil
 import sys
+import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
 from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor
 from email.utils import parsedate_to_datetime
 from html.parser import HTMLParser
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+import trafilatura
 from PIL import Image, ImageDraw, ImageFont
 
 ROOT = Path(__file__).parent
@@ -40,10 +44,6 @@ DEFAULT_SIZE = (1072, 1448)
 CLOCK_BAND = 0.12  # fracción de alto reservada para la hora que dibuja el Kindle
 BACK_BAND = 0.12   # en una nota, tocar esta franja de arriba vuelve al dashboard
 
-NEWS_FEED = "https://www.lanacion.com.ar/arc/outboundfeeds/rss/?outputType=xml"
-NEWS_MAX = 14            # noticias candidatas (se dibujan las que entren)
-PER_CATEGORY = 2         # variedad: como mucho 2 por sección
-SKIP_CATEGORIES = {"california", "florida", "texas", "nueva york", "estados unidos"}  # contenido para EE.UU.
 ARTICLE_MAX_PAGES = 12
 
 UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) AppleWebKit/537.36 Chrome/130 Safari/537.36"
@@ -155,35 +155,165 @@ def article_paragraphs(raw_html: str) -> list[tuple[str, bool]]:
     return p.paras
 
 
-def get_news() -> list[dict]:
-    root = ET.fromstring(fetch(NEWS_FEED))
-    content_tag = "{http://purl.org/rss/1.0/modules/content/}encoded"
-    out, per_cat = [], {}
-    for item in root.iter("item"):
-        title = html.unescape(item.findtext("title") or "").strip()
-        cat = (item.findtext("category") or "").strip()
-        link = (item.findtext("link") or "").strip()
-        if not title or cat.lower() in SKIP_CATEGORIES or per_cat.get(cat, 0) >= PER_CATEGORY:
-            continue
-        body = item.findtext(content_tag) or ""
-        paras = article_paragraphs(body)
-        if not paras:
-            continue
+ATOM = "{http://www.w3.org/2005/Atom}"
+CONTENT = "{http://purl.org/rss/1.0/modules/content/}encoded"
+HN_QUERY = ("AI OR LLM OR GPT OR Claude OR Anthropic OR OpenAI OR Gemini OR DeepMind "
+            "OR Llama OR Mistral OR DeepSeek OR Qwen OR agent OR model")
+FEEDS = [  # (fuente, url, máx. notas de esta fuente)
+    ("OpenAI", "https://openai.com/news/rss.xml", 2),
+    ("Google DeepMind", "https://deepmind.google/blog/rss.xml", 2),
+    ("Simon Willison", "https://simonwillison.net/atom/entries/", 2),
+    ("Hacker News", "https://hnrss.org/newest?points=150&q=" + urllib.parse.quote(HN_QUERY), 3),
+    ("TechCrunch", "https://techcrunch.com/category/artificial-intelligence/feed/", 2),
+    ("The Verge", "https://www.theverge.com/rss/ai-artificial-intelligence/index.xml", 2),
+]
+ANTHROPIC_NEWS = "https://www.anthropic.com/news"
+ANTHROPIC_MAX, ANTHROPIC_DAYS = 2, 7   # lo nuevo de Anthropic va arriba durante una semana
+NEWS_DAYS = 3                          # el resto: solo lo de los últimos 3 días
+NEWS_MAX = 14                          # candidatas (se dibujan las que entren)
+
+
+def _parse_date(s: str | None):
+    if not s:
+        return None
+    s = s.strip()
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", s):  # solo el día: sin hora que mostrar
+        return datetime.fromisoformat(s).replace(hour=12, second=1, tzinfo=TZ)
+    try:
+        d = datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except ValueError:
         try:
-            when = parsedate_to_datetime(item.findtext("pubDate") or "").astimezone(TZ)
+            d = parsedate_to_datetime(s)
         except (TypeError, ValueError):
-            when = None
-        per_cat[cat] = per_cat.get(cat, 0) + 1
-        out.append({
-            # cambia si se edita la nota (ej. las "en vivo"): el Kindle solo baja ids nuevos
-            "id": hashlib.sha1(f"{link or title}\n{body}".encode()).hexdigest()[:10],
-            "title": title, "cat": cat, "when": when, "paras": paras,
-        })
-        if len(out) >= NEWS_MAX:
-            break
-    if not out:
-        raise RuntimeError("La Nación: feed sin notas")
+            return None
+    return (d if d.tzinfo else d.replace(tzinfo=ZoneInfo("UTC"))).astimezone(TZ)
+
+
+def _plain(raw_html: str) -> list[tuple[str, bool]]:
+    return article_paragraphs(raw_html) if "<" in raw_html else \
+        [(p.strip(), False) for p in raw_html.split("\n") if p.strip()]
+
+
+def _page_text(url: str) -> tuple[list[tuple[str, bool]], datetime | None, str | None]:
+    """Baja la página y saca el cuerpo de la nota (párrafos, fecha, título)."""
+    page = fetch(url)
+    meta = trafilatura.extract_metadata(page)
+    body = trafilatura.extract(page, favor_precision=True, include_comments=False,
+                               include_tables=False, output_format="html") or ""
+    paras = [(t, h) for t, h in article_paragraphs(body)]
+    return paras, _parse_date(meta.date if meta else None), (meta.title if meta else None)
+
+
+def _feed_items(source: str, url: str) -> list[dict]:
+    root = ET.fromstring(fetch(url))
+    out = []
+    for it in list(root.iter("item")) or list(root.iter(ATOM + "entry")):
+        title = html.unescape(it.findtext("title") or it.findtext(ATOM + "title") or "").strip()
+        link = (it.findtext("link") or "").strip()
+        if not link:
+            el = it.find(ATOM + "link")
+            link = el.get("href", "") if el is not None else ""
+        when = _parse_date(it.findtext("pubDate") or it.findtext(ATOM + "published")
+                           or it.findtext(ATOM + "updated"))
+        body = it.findtext(CONTENT) or it.findtext(ATOM + "content") or ""
+        summary = it.findtext("description") or it.findtext(ATOM + "summary") or ""
+        if source == "Hacker News":
+            summary = ""  # la descripción de hnrss es solo metadata (puntos, comentarios)
+        if title and link:
+            out.append({"source": source, "title": title, "link": link, "when": when,
+                        "body": body, "summary": summary})
     return out
+
+
+def _anthropic_items() -> list[dict]:
+    """Notas de anthropic.com: las tarjetas de /news + lo que el sitemap marca como nuevo."""
+    found: dict[str, str] = {}
+    cards: dict[str, str] = {}
+    page = fetch(ANTHROPIC_NEWS)
+    for m in re.finditer(r'<a[^>]+href="([^"#?]+)"[^>]*>\s*<h[234][^>]*>(.*?)</h[234]>', page, re.S):
+        href, title = m.groups()
+        link = href if href.startswith("http") else "https://www.anthropic.com" + href
+        if "anthropic.com" in link:
+            cards.setdefault(link, html.unescape(re.sub(r"<[^>]+>", "", title)).strip())
+    try:
+        sm = fetch("https://www.anthropic.com/sitemap.xml")
+        cutoff = datetime.now(TZ).timestamp() - ANTHROPIC_DAYS * 86400
+        for loc, mod in re.findall(r"<loc>([^<]+/news/[^<]+)</loc>\s*<lastmod>([^<]+)</lastmod>", sm):
+            d = _parse_date(mod)
+            if d and d.timestamp() >= cutoff:
+                found.setdefault(loc.strip(), "")
+    except Exception as e:
+        print(f"[warn] sitemap de Anthropic: {e}", file=sys.stderr)
+    for link, title in list(cards.items())[:8]:  # las primeras tarjetas = lo más reciente
+        found[link] = title or found.get(link, "")
+    return [{"source": "Anthropic", "title": t, "link": l, "when": None, "body": "", "summary": ""}
+            for l, t in found.items()]
+
+
+def _words(t: str) -> set[str]:
+    return {w for w in re.findall(r"[a-z0-9.]+", t.lower()) if len(w) > 3}
+
+
+def _similar(a: str, b: str) -> bool:
+    wa, wb = _words(a), _words(b)
+    return bool(wa and wb) and len(wa & wb) / min(len(wa), len(wb)) >= 0.6
+
+
+def _fill_text(n: dict) -> dict:
+    """Asegura texto para leer: el del feed si es completo, si no la página, si no el resumen."""
+    paras = _plain(n["body"]) if len(re.sub(r"<[^>]+>", "", n["body"])) > 800 else []
+    if not paras:
+        try:
+            paras, when, title = _page_text(n["link"])
+            n["when"] = n["when"] or when
+            if n["source"] == "Anthropic" and title:
+                n["title"] = title.split(" \\ ")[0].strip()
+        except Exception as e:
+            print(f"[warn] texto de {n['link']}: {e}", file=sys.stderr)
+    if sum(len(t) for t, _ in paras) < 300 and n["summary"]:
+        paras = _plain(n["summary"]) + paras
+    domain = urllib.parse.urlparse(n["link"]).netloc.removeprefix("www.")
+    paras.append((f"Nota completa: {domain}", True))
+    n["paras"] = paras
+    return n
+
+
+def get_news() -> list[dict]:
+    now = datetime.now(TZ)
+    with ThreadPoolExecutor(8) as pool:
+        lists = list(pool.map(lambda f: _safe_list(_feed_items, *f[:2]), FEEDS))
+        anth = _safe_list(_anthropic_items)
+        anth = list(pool.map(_fill_text, anth))
+    anth = sorted((n for n in anth if n["when"] and (now - n["when"]).days < ANTHROPIC_DAYS and n["title"]),
+                  key=lambda n: n["when"], reverse=True)
+    pinned = anth[:ANTHROPIC_MAX]
+    rest = []
+    for (source, _, cap), items in zip(FEEDS, lists):
+        fresh = [n for n in items if n["when"] and (now - n["when"]).days < NEWS_DAYS]
+        rest += sorted(fresh, key=lambda n: n["when"], reverse=True)[:cap]
+    rest.sort(key=lambda n: n["when"], reverse=True)
+    chosen = list(pinned)
+    for n in rest:
+        if len(chosen) >= NEWS_MAX:
+            break
+        if not any(_similar(n["title"], c["title"]) for c in chosen):
+            chosen.append(n)
+    with ThreadPoolExecutor(8) as pool:
+        chosen = pinned + list(pool.map(_fill_text, chosen[len(pinned):]))
+    for n in chosen:
+        n["star"] = n["source"] == "Anthropic"
+        n["id"] = hashlib.sha1(f"{n['link']}\n{n['paras']}".encode()).hexdigest()[:10]
+    if not chosen:
+        raise RuntimeError("sin noticias de AI")
+    return chosen
+
+
+def _safe_list(fn, *a) -> list:
+    try:
+        return fn(*a)
+    except Exception as e:  # una fuente caída no tira las demás
+        print(f"[warn] {fn.__name__}{a[:1]}: {e}", file=sys.stderr)
+        return []
 
 
 def safe(fn, *a):
@@ -258,9 +388,12 @@ class Painter:
 
 
 def meta_line(n: dict) -> str:
-    parts = [n["cat"]] if n["cat"] else []
-    if n["when"]:
-        parts.append(f"{n['when']:%H:%M}")
+    parts = [n["source"]]
+    w = n.get("when")
+    if w:
+        now = datetime.now(TZ)
+        day = "hoy" if w.date() == now.date() else f"{w.day} {MESES[w.month - 1][:3]}"
+        parts.append(day if w.second == 1 else (f"{w:%H:%M}" if day == "hoy" else f"{day} {w:%H:%M}"))
     return " · ".join(parts)
 
 
@@ -298,14 +431,15 @@ def render_dash(size, now, weather, news, errors):
     y += round(24 * u)
 
     # noticias: todo el resto de la pantalla
-    y = p.heading(y, "Noticias · La Nación · tocá una para leerla")
+    y = p.heading(y, "Noticias de AI · tocá una para leerla")
     footer_y = h - round(44 * u)
     zones = []
     if news:
         maxw = w - 2 * m - 30 * u
         line_h, gap = round(35 * u), round(16 * u)
         for n in news:
-            lines = p.wrap(n["title"], 28, maxw, bold=True, max_lines=2)
+            title = ("★ " if n.get("star") else "") + n["title"]
+            lines = p.wrap(title, 28, maxw, bold=True, max_lines=2)
             need = len(lines) * line_h + round(27 * u) + gap
             if y + need > footer_y - 10 * u:
                 break
@@ -374,7 +508,7 @@ def render_article(size, n) -> list[Image.Image]:
         if i < total:
             hint = "← izquierda: anterior · derecha: siguiente →"
         else:
-            hint = "Fin" + (" · sigue en lanacion.com.ar" if truncated else "") + " · tocá para volver"
+            hint = "Fin" + (" · sigue en la fuente original" if truncated else "") + " · tocá para volver"
         p.text((w / 2, h - round(46 * u)), hint, 22, fill=110, anchor="ma")
         imgs.append(p.finish())
     return imgs
